@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-animatool"
+version = "0.1.1"
+description = "Standalone MCP server + client for generating Anima-style images via a remote/local ComfyUI Server API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Moeblack" }]
+keywords = ["comfyui", "anima", "mcp", "tool-use", "ai-agent", "cursor"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Graphics",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "mcp>=1.0.0",
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+server = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "pydantic>=2.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/Moeblack/ComfyUI-AnimaTool"
+Repository = "https://github.com/Moeblack/ComfyUI-AnimaTool"
+
+[project.scripts]
+animatool-mcp = "animatool_mcp.mcp_server:main"
+animatool-generate = "animatool_mcp.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+animatool_mcp = [
+  "resources/schemas/*.json",
+  "resources/workflow/*.json",
+  "resources/knowledge/*.md",
+]
+
