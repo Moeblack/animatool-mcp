@@ -1,0 +1,58 @@
+name: Sync resources from ComfyUI-AnimaTool
+
+on:
+  # 手动触发
+  workflow_dispatch:
+  # 每天 UTC 06:00 自动检查一次（北京时间 14:00）
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout animatool-mcp
+        uses: actions/checkout@v4
+
+      - name: Checkout ComfyUI-AnimaTool (source of truth)
+        uses: actions/checkout@v4
+        with:
+          repository: Moeblack/ComfyUI-AnimaTool
+          path: _source
+          sparse-checkout: |
+            schemas
+            executor/workflow_template.json
+            knowledge
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run sync script (check mode first)
+        id: check
+        run: |
+          python tools/sync_from_comfyui_animatool.py --source _source --check || echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run sync script (write mode)
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          python tools/sync_from_comfyui_animatool.py --source _source --write
+
+      - name: Create Pull Request
+        if: steps.check.outputs.needs_sync == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore: sync resources from ComfyUI-AnimaTool"
+          title: "chore: sync resources from ComfyUI-AnimaTool"
+          body: |
+            Automated sync of shared resources (schema, workflow template, knowledge) from
+            [ComfyUI-AnimaTool](https://github.com/Moeblack/ComfyUI-AnimaTool).
+
+            Please review and merge.
+          branch: auto/sync-resources
+          delete-branch: true
