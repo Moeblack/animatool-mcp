@@ -158,6 +158,23 @@ animatool-generate --comfyui-url http://127.0.0.1:8188 --json-file payload.json
 
 ---
 
+## 生态系统 (Ecosystem)
+
+animatool-mcp 是 AnimaTool 生态的一部分，推荐搭配以下项目使用以获得最佳体验：
+
+### 1. [ComfyUI-AnimaTool](https://github.com/Moeblack/ComfyUI-AnimaTool)
+
+本项目的官方 ComfyUI 插件版本。如果你是 ComfyUI 重度用户，推荐直接安装插件版，它包含了完整的 expert 知识库和更多高级功能。
+
+### 2. [SillyTavern MCP Client](https://github.com/Moeblack/sillytavern-mcp-client)
+
+想在 **SillyTavern (酒馆)** 里画图？
+
+- 使用 **SillyTavern MCP Client** 连接本工具（支持 stdio/http）。
+- 搭配 **[SillyTavern Tool Use Fix](https://github.com/Moeblack/sillytavern-tooluse-fix)** 获得最佳的图片显示体验（自动合并消息、原生渲染）。
+
+---
+
 ## 环境变量速查
 
 | 环境变量 | 说明 | 默认值 |
