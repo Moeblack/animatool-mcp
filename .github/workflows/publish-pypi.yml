@@ -1,9 +1,9 @@
 name: Publish to PyPI
 
 on:
-  release:
-    types: [published]
-  # 也可以选择手动触发
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 jobs:

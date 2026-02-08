@@ -1,3 +1,13 @@
+"""
+AnimaExecutor — 独立客户端。
+
+通过标准 ComfyUI Server API（/prompt, /history, /view, /models）
+在本地或云端 ComfyUI 上执行 Anima 工作流，获取输出图片。
+
+相比本体 (ComfyUI-AnimaTool/executor)，本模块：
+- 使用 requests + 云端鉴权（Bearer / Basic / 自定义 Headers / SSL）
+- 不依赖 ComfyUI custom_nodes 安装
+"""
 from __future__ import annotations
 
 import base64
@@ -15,8 +25,13 @@ from urllib.parse import urlencode, urljoin
 import requests
 
 from .config import AnimaToolConfig
+from .history import HistoryManager
 from .resources import load_workflow_template
 
+
+# ============================================================
+# Utilities
+# ============================================================
 
 def _round_up(x: int, base: int) -> int:
     if base <= 1:
@@ -42,13 +57,6 @@ def estimate_size_from_ratio(
     target_megapixels: float = 1.0,
     round_to: int = 16,
 ) -> Tuple[int, int]:
-    """
-    只给定长宽比时，估算 width/height，使像素数接近 target_megapixels。
-    宽高会向上取整到 round_to 的倍数。
-
-    注意：Anima/Cosmos 要求宽高至少对齐到 16（8×2），否则可能触发
-    "should be divisible by spatial_patch_size"。
-    """
     r = _parse_aspect_ratio(aspect_ratio)
     target_px = max(1.0, float(target_megapixels)) * 1_000_000.0
     w = int(math.sqrt(target_px * r))
@@ -75,9 +83,7 @@ def _join_csv(*parts: str) -> str:
 
 
 def build_anima_positive_text(prompt_json: Dict[str, Any]) -> str:
-    """
-    顺序：[质量/安全/年份] [人数] [角色] [作品] [画师] [风格] [外观] [标签] [环境] [自然语言]
-    """
+    """按 Anima 推荐顺序拼接正面提示词。"""
     return _join_csv(
         prompt_json.get("quality_meta_year_safe", ""),
         prompt_json.get("count", ""),
@@ -102,28 +108,31 @@ class GeneratedImage:
     content: Optional[bytes] = None
 
 
-class AnimaExecutor:
-    """
-    独立客户端：将结构化 JSON 注入 ComfyUI workflow（API JSON）并执行，获取输出图片。
+# ============================================================
+# AnimaExecutor
+# ============================================================
 
-    依赖的 ComfyUI 接口：
-    - POST  /prompt
-    - GET   /history/{prompt_id}
-    - GET   /view?filename=...&subfolder=...&type=...
-    - GET   /system_stats（健康检查）
-    """
+class AnimaExecutor:
+    """将结构化 JSON 注入 ComfyUI workflow 并执行，获取输出图片。"""
+
+    _SUPPORTED_MODEL_TYPES = ("loras", "diffusion_models", "vae", "text_encoders")
 
     def __init__(self, config: Optional[AnimaToolConfig] = None):
         self.config = config or AnimaToolConfig()
         self._client_id = str(uuid.uuid4())
-
         self._workflow_template: Dict[str, Any] = load_workflow_template()
 
-        # 允许并发：为每个线程创建独立 Session，避免 requests.Session 跨线程共享的不确定性
+        # 远端模型路径分隔符缓存
+        self._remote_model_path_sep_cache: Dict[str, str] = {}
+
+        # 线程局部 Session（避免跨线程共享 requests.Session）
         self._tls = threading.local()
 
+        # 生成历史管理器
+        self.history = HistoryManager()
+
     # -------------------------
-    # requests helper
+    # requests helper (云端鉴权)
     # -------------------------
     def _get_session(self) -> requests.Session:
         s = getattr(self._tls, "session", None)
@@ -163,11 +172,146 @@ class AnimaExecutor:
     def _http_post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._request("POST", path, json_body=payload, expect_json=True)
 
-    def _http_get_json(self, path: str) -> Dict[str, Any]:
+    def _http_get_json(self, path: str) -> Any:
         return self._request("GET", path, expect_json=True)
 
     def _http_get_bytes(self, path: str) -> bytes:
         return self._request("GET", path, expect_json=False)
+
+    # -------------------------
+    # Model listing
+    # -------------------------
+    def _detect_remote_model_path_sep(self, model_type: str) -> str:
+        """探测远端 ComfyUI 返回的模型名路径分隔符。"""
+        if model_type in self._remote_model_path_sep_cache:
+            return self._remote_model_path_sep_cache[model_type]
+
+        files = self._http_get_json(f"models/{model_type}")
+        sep = "/"
+        if isinstance(files, list):
+            for it in files:
+                if not isinstance(it, str):
+                    continue
+                if "\\" in it:
+                    sep = "\\"
+                    break
+                if "/" in it:
+                    sep = "/"
+                    break
+
+        self._remote_model_path_sep_cache[model_type] = sep
+        return sep
+
+    def _normalize_remote_model_name(self, name: str, model_type: str) -> str:
+        """将用户输入的 name 规范化为远端 ComfyUI 可接受的模型名格式。"""
+        import os
+        s = (name or "").strip()
+        if not s:
+            return s
+
+        remote_sep = self._detect_remote_model_path_sep(model_type)
+        s = s.replace("/", remote_sep).replace("\\", remote_sep)
+
+        while s.startswith(remote_sep):
+            s = s[len(remote_sep):]
+        while s.startswith(os.sep):
+            s = s[len(os.sep):]
+
+        return s
+
+    def _read_lora_metadata(self, lora_name: str) -> Optional[Dict[str, Any]]:
+        """读取 LoRA 的 sidecar 元数据文件（同名 .json）。仅本地可用。"""
+        import os
+        if not self.config.comfyui_models_dir:
+            return None
+
+        models_dir = Path(self.config.comfyui_models_dir)
+        clean_name = lora_name.strip().replace("/", os.sep).replace("\\", os.sep)
+        while clean_name.startswith(os.sep):
+            clean_name = clean_name[1:]
+
+        search_paths = [
+            models_dir / "loras" / f"{clean_name}.json",
+            models_dir / "loras" / f"{os.path.splitext(clean_name)[0]}.json",
+        ]
+
+        for meta_path in search_paths:
+            if meta_path and meta_path.exists():
+                try:
+                    return json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+        return None
+
+    def list_models(self, model_type: str) -> List[Dict[str, Any]]:
+        """列出 ComfyUI 模型文件。"""
+        model_type = (model_type or "").strip()
+        if model_type not in self._SUPPORTED_MODEL_TYPES:
+            raise ValueError(f"不支持的 model_type={model_type!r}，仅支持：{self._SUPPORTED_MODEL_TYPES}")
+
+        files = self._http_get_json(f"models/{model_type}")
+
+        if not isinstance(files, list):
+            raise RuntimeError(f"ComfyUI /models/{model_type} 返回异常：{files!r}")
+
+        results: List[Dict[str, Any]] = []
+        for raw_name in files:
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                continue
+
+            normalized_name = raw_name.replace("\\", "/")
+            item: Dict[str, Any] = {"name": normalized_name}
+
+            if model_type == "loras":
+                meta = self._read_lora_metadata(raw_name)
+                if not meta:
+                    # 强制要求：不提供 json sidecar 的 LoRA 不允许被 list 出来
+                    continue
+                item["metadata"] = meta
+
+            results.append(item)
+
+        return results
+
+    # -------------------------
+    # LoRA injection
+    # -------------------------
+    def _inject_loras(self, wf: Dict[str, Any], loras: Any) -> None:
+        """在 UNET 与 KSampler(model) 之间注入多 LoRA（仅 UNET）。"""
+        if not loras:
+            return
+        if not isinstance(loras, list):
+            raise ValueError("loras 必须是数组：[{name, weight}, ...]")
+
+        if "19" not in wf or "inputs" not in wf["19"] or "model" not in wf["19"]["inputs"]:
+            raise RuntimeError("workflow_template.json 缺少 KSampler(19).inputs.model，无法注入 LoRA")
+
+        prev_model = wf["19"]["inputs"]["model"]
+
+        numeric_ids = [int(k) for k in wf.keys() if str(k).isdigit()]
+        next_id = (max(numeric_ids) + 1) if numeric_ids else 1
+
+        for i, lora in enumerate(loras):
+            if not isinstance(lora, dict):
+                continue
+            name = str(lora.get("name") or "").strip()
+            if not name:
+                continue
+            name = self._normalize_remote_model_name(name, "loras")
+            weight = float(lora.get("weight", 1.0))
+
+            node_id = str(next_id + i)
+            wf[node_id] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {
+                    "model": prev_model,
+                    "lora_name": name,
+                    "strength_model": weight,
+                },
+            }
+            prev_model = [node_id, 0]
+
+        wf["19"]["inputs"]["model"] = prev_model
 
     # -------------------------
     # Core workflow injection
@@ -175,7 +319,7 @@ class AnimaExecutor:
     def _inject(self, prompt_json: Dict[str, Any]) -> Dict[str, Any]:
         wf = deepcopy(self._workflow_template)
 
-        # 模型文件：优先参数指定，其次 config 默认
+        # 模型文件
         clip_name = prompt_json.get("clip_name") or self.config.clip_name
         unet_name = prompt_json.get("unet_name") or self.config.unet_name
         vae_name = prompt_json.get("vae_name") or self.config.vae_name
@@ -183,6 +327,9 @@ class AnimaExecutor:
         wf["45"]["inputs"]["clip_name"] = str(clip_name)
         wf["44"]["inputs"]["unet_name"] = str(unet_name)
         wf["15"]["inputs"]["vae_name"] = str(vae_name)
+
+        # LoRA 注入
+        self._inject_loras(wf, prompt_json.get("loras"))
 
         # 文本
         positive = (prompt_json.get("positive") or "").strip()
@@ -229,13 +376,12 @@ class AnimaExecutor:
         wf["19"]["inputs"]["scheduler"] = str(prompt_json.get("scheduler") or wf["19"]["inputs"]["scheduler"])
         wf["19"]["inputs"]["denoise"] = float(prompt_json.get("denoise") or wf["19"]["inputs"]["denoise"])
 
-        # 文件名前缀
         wf["52"]["inputs"]["filename_prefix"] = str(prompt_json.get("filename_prefix") or wf["52"]["inputs"]["filename_prefix"])
 
         return wf
 
     # -------------------------
-    # Health check & model check
+    # Health check
     # -------------------------
     def check_comfyui_health(self) -> Tuple[bool, str]:
         try:
@@ -329,8 +475,6 @@ class AnimaExecutor:
             out_dir.mkdir(parents=True, exist_ok=True)
 
         for im in images:
-            # 注意：即便不保存到本地，也需要下载 bytes 以返回 base64（MCP ImageContent）
-            # _http_get_bytes 支持传入绝对 URL
             content = self._http_get_bytes(im.view_url)
 
             saved_path = None
@@ -394,13 +538,31 @@ class AnimaExecutor:
                 }
             )
 
-        return {
+        actual_seed = int(prompt["19"]["inputs"]["seed"])
+        actual_width = int(prompt["28"]["inputs"]["width"])
+        actual_height = int(prompt["28"]["inputs"]["height"])
+
+        result = {
             "success": True,
             "prompt_id": prompt_id,
             "positive": prompt["11"]["inputs"]["text"],
             "negative": prompt["12"]["inputs"]["text"],
-            "width": prompt["28"]["inputs"]["width"],
-            "height": prompt["28"]["inputs"]["height"],
+            "seed": actual_seed,
+            "width": actual_width,
+            "height": actual_height,
             "images": images_data,
         }
 
+        # 记录到历史
+        record = self.history.add(
+            params=prompt_json,
+            positive_text=result["positive"],
+            negative_text=result["negative"],
+            prompt_id=prompt_id,
+            seed=actual_seed,
+            width=actual_width,
+            height=actual_height,
+        )
+        result["history_id"] = record.id
+
+        return result

@@ -12,6 +12,26 @@
 
 ## 安装
 
+### 方式一：使用 uvx (推荐)
+
+无需手动安装 Python 包，直接在 Cursor 配置中使用 `uvx` 运行（需安装 [uv](https://github.com/astral-sh/uv)）：
+
+```json
+{
+  "mcpServers": {
+    "animatool": {
+      "command": "uvx",
+      "args": ["--from", "comfyui-animatool", "animatool-mcp"],
+      "env": {
+        "COMFYUI_URL": "http://127.0.0.1:8188"
+      }
+    }
+  }
+}
+```
+
+### 方式二：使用 pip
+
 ```bash
 pip install comfyui-animatool
 ```
@@ -20,7 +40,7 @@ pip install comfyui-animatool
 
 ## Cursor 配置（MCP）
 
-在你的项目中创建/编辑 `.cursor/mcp.json`：
+如果你使用 **pip 安装**，请在 `.cursor/mcp.json` 中配置：
 
 ```json
 {
